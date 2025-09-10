@@ -1,0 +1,80 @@
+-- final - traffic dip
+
+with top_combinations as (
+select
+charge_currency,
+countDistinct(case when payment_attempt_id <> '' then payin_id end) as total_attempts
+from payin
+-- where payin_created_at >= now() - interval 10 day and payment_attempt_id <> ''
+where payin_created_at >= '2025-09-08' - interval 10 day and payment_attempt_id <> ''
+group by charge_currency
+order by total_attempts desc
+limit 10
+),
+
+historical_traffic as (
+select
+a.charge_currency,
+toDate(b.payin_created_at) as date,
+toHour(b.payin_created_at) as hour,
+intDiv(toMinute(b.payin_created_at), 30) as half_hour,
+countDistinct(case when b.payment_attempt_id <> '' then b.payin_id end) as attempts
+from top_combinations a
+left join payin b on (
+a.charge_currency = b.charge_currency
+-- and b.payin_created_at >= now() - interval 10 day)
+and b.payin_created_at >= Date('2025-09-08') - interval 10 day)
+group by 1,2,3,4
+),
+
+stats as (
+select
+charge_currency,hour,half_hour,
+quantile(0.5)(attempts) as median_attempts,
+stddevPop(attempts) as std_dev_attempts
+from historical_traffic
+-- where date >= toDate(now()) - 7
+-- and date < toDate(now()) 
+where date >= toDate('2025-09-08') - 7
+and date < toDate('2025-09-08')
+and hour = toHour(now() - interval 60 minute) 
+and half_hour = intDiv(toMinute(now()), 30)  
+group by 1,2,3
+),
+
+today as (
+select
+charge_currency,
+hour,
+half_hour,
+attempts as current_attempts
+from historical_traffic
+where date = toDate('2025-09-08')
+-- where date = toDate(now())
+and hour = toHour(now() - interval 60 minute) 
+and half_hour = intDiv(toMinute(now()), 30)  
+),
+
+final as (
+select
+t.charge_currency,
+t.hour as hour_utc
+,t.half_hour as half_hour_utc,
+toHour(toTimeZone(now() - interval 60 minute, 'Asia/Kolkata')) as hour_ist,
+
+t.current_attempts,s.median_attempts,s.std_dev_attempts,
+
+(s.median_attempts - t.current_attempts) as traffic_diff_now, (3 * s.std_dev_attempts) as threshold,
+
+case when (s.median_attempts - t.current_attempts) > (3 * s.std_dev_attempts) then 'alert' else null end as status
+from today t join stats s on t.charge_currency = s.charge_currency
+and t.hour = s.hour
+and t.half_hour = s.half_hour)
+
+select * from final
+-- where status = 'alert'
+
+
+
+
+
