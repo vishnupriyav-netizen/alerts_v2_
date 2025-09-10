@@ -1,0 +1,99 @@
+with top_combinations as (
+select
+charge_currency,provider,payment_method_name,
+countDistinct(case when payment_attempt_id is not null then payin_id end) as total_attempts,
+round(count(distinct case when payment_attempt_status = 'succeeded' then payin_id else null end) * 1.0 / 
+nullif(count(distinct case when payment_attempt_id <> '' then payin_id else null end), 0), 3) as sr
+from payin
+-- where payin_created_at >= now() - interval 10 day and payment_attempt_id <> ''
+where payin_created_at >= '2025-09-08' - interval 10 day and payment_attempt_id <> ''
+group by charge_currency, provider, payment_method_name
+order by total_attempts desc
+limit 10
+), 
+
+historical_traffic as (
+select
+a.charge_currency,
+a.provider,
+a.payment_method_name,
+toDate(b.payin_created_at) as date,
+toHour(b.payin_created_at) as hour,
+intDiv(toMinute(b.payin_created_at), 30) as half_hour,
+countDistinct(case when payment_attempt_id <> '' then b.payin_id end) as attempts,
+
+round(count(distinct case when payment_attempt_status = 'succeeded' then payin_id else null end) * 1.0 / 
+    nullif(count(distinct case when payment_attempt_id <> '' then payin_id else null end), 0), 3) as sr,
+
+
+round(count(distinct case when payment_attempt_status = 'failed' then payin_id else null end) * 1.0 / 
+    nullif(count(distinct case when b.payment_attempt_id <> '' then payin_id else null end), 0), 3) as fr
+    
+from top_combinations a
+left join payin b on 
+a.charge_currency = b.charge_currency
+and a.provider = b.provider
+and a.payment_method_name = b.payment_method_name
+-- and b.payin_created_at >= now() - interval 10 day
+and b.payin_created_at >= toDate('2025-09-08') - interval 10 day
+group by a.charge_currency, a.provider, a.payment_method_name, date, hour, half_hour
+),
+
+stats as (
+select
+charge_currency,provider,
+payment_method_name,hour,half_hour,
+
+quantile(0.5)(sr) as median_sr,
+stddevPop(sr) as std_dev_sr
+
+from historical_traffic
+-- where date >= toDate(now()) - 7
+-- and date < toDate(now())    
+where date >= toDate('2025-09-08') - 7
+and date < toDate('2025-09-08')                 
+and hour = toHour(now() - interval 60 minute) 
+and half_hour = intDiv(toMinute(now()), 30)  
+group by charge_currency, provider, payment_method_name, hour, half_hour
+),
+
+today as (
+select
+charge_currency,
+provider,
+payment_method_name,
+hour,
+half_hour,
+attempts as current_attempts, 
+sr as current_sr, fr as failure_rate
+from historical_traffic
+where date = toDate('2025-09-08')
+and hour = toHour(now() - interval 60 minute) 
+and half_hour = intDiv(toMinute(now()), 30)  
+),
+
+final as (
+
+select
+t.charge_currency,t.provider,t.payment_method_name,
+t.hour as hour_utc
+,t.half_hour as half_hour_utc,
+toHour(toTimeZone(now() - interval 60 minute, 'Asia/Kolkata')) as hour_ist,
+
+t.current_attempts, t.current_sr*100.0 as current_sr , t.failure_rate*100.0 as failure_rate ,
+
+s.median_sr*100.0 as median_sr, s.std_dev_sr*100.0 as std_dev_sr,
+
+(s.median_sr - t.current_sr)*100.0 as sr_diff_now, 
+
+case when ((median_sr - current_sr) > std_dev_sr) and failure_rate > 0.5 and current_attempts > 40 then 'alert' end as status
+
+from today t join stats s on t.charge_currency = s.charge_currency
+and t.provider = s.provider and t.payment_method_name = s.payment_method_name and t.hour = s.hour
+and t.half_hour = s.half_hour
+)
+
+select *
+from final where status = 'alert'
+
+
