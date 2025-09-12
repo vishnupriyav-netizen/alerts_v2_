@@ -1,0 +1,75 @@
+with top_combinations as (
+select
+charge_currency,provider,payment_method_name,account_id, business_name, 
+countDistinct(case when payment_attempt_id is not null then payin_id end) as total_attempts,
+round(count(distinct case when payment_attempt_status = 'succeeded' then payin_id else null end) * 1.0 / 
+nullif(count(distinct case when payment_attempt_id <> '' then payin_id else null end), 0), 3) as sr
+from payin
+where payin_created_at >= '2025-08-24' - interval 10 day and payment_attempt_id <> ''
+-- where payin_created_at >= '2025-09-08' - interval 10 day and payment_attempt_id <> ''
+group by charge_currency, provider, payment_method_name, account_id, business_name
+order by total_attempts desc
+limit 20
+), 
+
+historical_traffic as (
+select
+a.charge_currency,
+a.provider,
+a.payment_method_name,
+a.account_id, a.business_name, 
+toDate(b.payin_created_at) as date,
+toHour(b.payin_created_at) as hour,
+intDiv(toMinute(b.payin_created_at), 30) as half_hour,
+
+countDistinct(case when payment_attempt_id <> '' then b.payin_id end) as attempts,
+
+round(count(distinct case when payment_attempt_status = 'succeeded' then payin_id else null end) * 1.0 / 
+    nullif(count(distinct case when payment_attempt_id <> '' then payin_id else null end), 0), 3) as sr,
+
+
+round(count(distinct case when payment_attempt_status = 'failed' then payin_id else null end) * 1.0 / 
+    nullif(count(distinct case when b.payment_attempt_id <> '' then payin_id else null end), 0), 3) as fr,
+    
+
+
+round(count(distinct case when payment_attempt_status = 'failed' and error_code >= 14000
+        AND error_code < 16000 then payin_id else null end) * 1.0 / 
+    nullif(count(distinct case when b.payment_attempt_id <> '' then payin_id else null end), 0), 3) as inorganic_fr
+    
+from top_combinations a
+left join payin b on 
+a.charge_currency = b.charge_currency
+and a.provider = b.provider
+and a.payment_method_name = b.payment_method_name
+and a.account_id = b.account_id
+and a.business_name = b.business_name
+and b.payin_created_at >= '2025-08-24'- interval 10 day
+-- and b.payin_created_at >= toDate('2025-09-08') - interval 10 day
+group by a.charge_currency, a.provider, a.payment_method_name, a.account_id, a.business_name, date, hour, half_hour
+),
+
+
+today as (
+select
+charge_currency,
+provider,
+payment_method_name,
+account_id, business_name,
+hour,
+half_hour,
+attempts as current_attempts, 
+sr as current_sr, fr as failure_rate, inorganic_fr
+from historical_traffic
+
+-- where date = toDate('2025-09-08')
+where date = '2025-08-24'
+-- group by 1,2,3,4,5,6,7
+and hour = 12
+-- and half_hour = intDiv(toMinute(now()), 30)  
+)
+select * from today 
+-- cbsodt
+-- where account_id = 'acc_cvpschj1d43oq38bu82g'
+
+where account_id = 'acc_cl49tts9efvo3ns25m50'
