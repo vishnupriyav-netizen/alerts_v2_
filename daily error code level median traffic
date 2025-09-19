@@ -1,0 +1,113 @@
+-- health metric review RCA (daily level) -- this has flaw with calculating median (gving wrong numbers)
+
+
+-- sr dip - RCA query  
+with top_combinations as (
+select
+charge_currency,provider,payment_method_type,
+countDistinct(case when payment_attempt_id is not null then payin_id end) as total_attempts
+from payin
+where payin_created_at >= now() - interval 10 day 
+-- where payin_created_at >= '2025-09-08' - interval 10 day 
+and payment_attempt_id <> ''
+group by charge_currency, provider, payment_method_type
+order by total_attempts desc
+limit 20
+), 
+
+historical_traffic as (
+select
+a.charge_currency,
+a.provider,
+a.payment_method_type,
+b.error_code,
+toDate(b.payin_created_at) as date,
+-- toHour(b.payin_created_at) as hour,
+-- intDiv(toMinute(b.payin_created_at), 30) as half_hour,
+countDistinct(case when payment_attempt_id <> '' then b.payin_id end) as attempts
+
+from top_combinations a
+left join payin b on 
+a.charge_currency = b.charge_currency
+and a.provider = b.provider
+and a.payment_method_type = b.payment_method_type
+and date >= toDate('2025-09-18') - 10
+and date <= toDate('2025-09-18')  
+where b.payment_attempt_status <> 'succeeded'
+-- and b.payin_created_at >= toDate('2025-09-08') - interval 10 day
+group by a.charge_currency, a.provider, a.payment_method_type, b.error_code, date
+),
+
+stats as (
+select
+charge_currency,provider,
+payment_method_type,
+error_code,
+ 
+-- hour,half_hour,
+quantile(0.5)(attempts) as median_attempts,
+stddevPop(attempts) as std_dev_attempts,
+groupArray(attempts) as daily_attempts_array
+
+from historical_traffic
+where date >= toDate('2025-09-18') - 10
+and date < toDate('2025-09-18')  
+-- where date >= toDate('2025-09-08') - 7
+-- and date < toDate('2025-09-08')                 
+-- and hour = toHour(now() - interval 60 minute) 
+-- and half_hour = intDiv(toMinute(now()), 30)  
+group by charge_currency, provider, payment_method_type, error_code
+-- , hour, half_hour
+),
+
+today as (
+select
+charge_currency,
+provider,
+payment_method_type,
+error_code,
+date,
+-- hour,
+-- half_hour,
+attempts as current_attempts
+from historical_traffic
+-- where date = toDate(now())
+where date = toDate('2025-09-18')
+-- and hour = toHour(now() - interval 60 minute) 
+-- and half_hour = intDiv(toMinute(now()), 30)  
+),
+
+
+final as (
+
+select
+t.charge_currency,t.provider,t.payment_method_type,
+t.error_code, date,
+
+-- t.hour as hour_utc
+-- ,t.half_hour as half_hour_utc,
+-- toHour(toTimeZone(now() - interval 60 minute, 'Asia/Kolkata')) as hour_ist,
+t.current_attempts, median_attempts, std_dev_attempts, daily_attempts_array,
+
+median_attempts - current_attempts as diff
+from today t join stats s on t.charge_currency = s.charge_currency
+and t.provider = s.provider and t.payment_method_type = s.payment_method_type and t.error_code = s.error_code 
+-- and t.hour = s.hour
+-- and t.half_hour = s.half_hour
+)
+
+select * from final order by diff desc
+-- where current_attempts > 40 and diff > 10 order by diff desc;
+
+; 
+
+
+
+
+select toDate(payin_created_at) as date, 
+countDistinct(case when payment_attempt_id <> '' then payin_id end) as attempts
+from payin where date >= toDate('2025-09-18') - 10 and
+provider = 'wepayments' and error_code = 14000
+group by 1
+order by date desc 
+
