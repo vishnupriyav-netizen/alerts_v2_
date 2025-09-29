@@ -1,0 +1,95 @@
+with top_combinations as (
+(SELECT charge_currency, provider, payment_method_name ,account_id, business_name
+ FROM payin
+ WHERE payin_created_at >= now() - interval 10 day AND payment_attempt_id != ''
+ GROUP BY charge_currency, provider, payment_method_name,account_id, business_name
+ ORDER BY uniq(payin_id) DESC
+ LIMIT 50)
+
+UNION DISTINCT
+
+(SELECT charge_currency, provider, payment_method_name,account_id, business_name
+ FROM payin
+ WHERE payin_created_at >= now() - interval 5 day AND payment_attempt_id != ''
+ GROUP BY charge_currency, provider, payment_method_name,account_id, business_name
+ ORDER BY uniq(payin_id) DESC
+ LIMIT 50)
+
+UNION DISTINCT
+
+(SELECT charge_currency, provider, payment_method_name,account_id, business_name
+ FROM payin
+ WHERE payin_created_at >= now() - interval 3 day AND payment_attempt_id != ''
+ GROUP BY charge_currency, provider, payment_method_name,account_id, business_name
+ ORDER BY uniq(payin_id) DESC
+ LIMIT 50)
+
+UNION DISTINCT
+
+(SELECT charge_currency, provider, payment_method_name,account_id, business_name
+ FROM payin
+ WHERE payin_created_at >= now() - interval 1 day AND payment_attempt_id != ''
+ GROUP BY charge_currency, provider, payment_method_name,account_id, business_name
+ ORDER BY uniq(payin_id) DESC
+ LIMIT 50)),
+
+historical_traffic as (
+select
+a.charge_currency,
+a.provider,
+a.payment_method_name,
+a.account_id, a.business_name, 
+toDate(b.payin_created_at) as date,
+toHour(b.payin_created_at) as hour,
+intDiv(toMinute(b.payin_created_at), 30) as half_hour,
+
+countDistinct(case when payment_attempt_id <> '' then b.payin_id end) as attempts,
+
+round(count(distinct case when payment_attempt_status = 'succeeded' then payin_id else null end) * 1.0 / 
+    nullif(count(distinct case when payment_attempt_id <> '' then payin_id else null end), 0), 3) as sr,
+
+
+round(count(distinct case when payment_attempt_status = 'failed' then payin_id else null end) * 1.0 / 
+    nullif(count(distinct case when b.payment_attempt_id <> '' then payin_id else null end), 0), 3) as fr,
+    
+
+
+round(count(distinct case when payment_attempt_status = 'failed' and error_code >= 14000
+        AND error_code < 16000 then payin_id else null end) * 1.0 / 
+    nullif(count(distinct case when b.payment_attempt_id <> '' then payin_id else null end), 0), 3) as inorganic_fr
+    
+from top_combinations a
+left join payin b on 
+a.charge_currency = b.charge_currency
+and a.provider = b.provider
+and a.payment_method_name = b.payment_method_name
+and a.account_id = b.account_id
+and a.business_name = b.business_name
+
+-- where payin_created_at >= now() - interval 10 day and payment_attempt_id <> ''
+
+and payin_created_at >= '2025-09-28' - interval 10 day and payment_attempt_id <> ''
+-- and b.payin_created_at >= toDate('2025-09-08') - interval 10 day
+group by a.charge_currency, a.provider, a.payment_method_name, a.account_id, a.business_name, date, hour, half_hour
+),
+
+
+today as (
+select
+charge_currency,
+provider,
+payment_method_name,
+account_id, business_name,
+date,
+hour,
+case when half_hour = 0 then '0-20 min' when half_hour = 1 then '20-40 min' when half_hour = 2 then '40-60 min' end as minute_interval,
+toHour(toTimeZone(now() - interval 60 minute, 'Asia/Kolkata')) as hour_ist,
+attempts as current_attempts, 
+sr as current_sr, fr as failure_rate, inorganic_fr,
+case when inorganic_fr> 0.9 and inorganic_fr*current_attempts > 3 then 'alert' end as status
+from historical_traffic
+where date = '2025-09-28'
+-- and hour = toHour(now() - interval 40 minute) 
+-- and half_hour = intDiv(toMinute(now() - interval 40 minute), 20)  
+)
+select * from today where provider = 'nomupay_hk'
