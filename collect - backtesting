@@ -1,0 +1,119 @@
+WITH
+date_spine AS (
+    SELECT toDate(today() - number) AS date
+    FROM numbers(10)
+),
+active_currencies AS (
+    SELECT provider, charge_currency
+    FROM payin FINAL
+    WHERE substr(payin_id, 1, 3) = 'col'
+      AND payin_created_at >= today() - 20
+      AND lower(seller_email) NOT LIKE '%@tazapay.com'
+      AND lower(seller_email) NOT LIKE '%@digitrade.com'
+    GROUP BY provider, charge_currency
+    HAVING count(*) > 100
+),
+expected_slots AS (
+    SELECT
+        d.date,
+        c.provider,
+        c.charge_currency
+    FROM date_spine d
+    CROSS JOIN active_currencies c
+    WHERE d.date < today()
+),
+actual AS (
+    SELECT
+        toDate(payin_created_at)                                                 AS date,
+        provider,
+        charge_currency,
+        countDistinct(payin_id)                                                  AS traffic
+    FROM payin FINAL
+    WHERE substr(payin_id, 1, 3) = 'col'
+      AND payin_created_at >= today() - 11
+      AND lower(seller_email) NOT LIKE '%@tazapay.com'
+      AND lower(seller_email) NOT LIKE '%@digitrade.com'
+    GROUP BY 1, 2, 3
+),
+historical AS (
+    SELECT
+        toDayOfWeek(toDate(payin_created_at))                                    AS day_of_week,
+        provider,
+        charge_currency,
+        toDate(payin_created_at)                                                 AS date,
+        countDistinct(payin_id)                                                  AS traffic
+    FROM payin FINAL
+    WHERE substr(payin_id, 1, 3) = 'col'
+      AND payin_created_at >= today() - 90
+      AND payin_created_at < today() - 10
+      AND lower(seller_email) NOT LIKE '%@tazapay.com'
+      AND lower(seller_email) NOT LIKE '%@digitrade.com'
+    GROUP BY 1, 2, 3, 4
+),
+historical_bracket AS (
+    SELECT
+        day_of_week,
+        provider,
+        charge_currency,
+        concat(
+            '[',
+            arrayStringConcat(
+                arrayMap(x -> toString(x),
+                    arraySlice(arrayReverseSort(groupArray(traffic)), 1, 4)
+                ),
+                ','
+            ),
+            ']'
+        )                                                                        AS last_4_same_dow
+    FROM (
+        SELECT day_of_week, provider, charge_currency, traffic
+        FROM historical
+        ORDER BY day_of_week, provider, charge_currency, date DESC
+    )
+    GROUP BY day_of_week, provider, charge_currency
+),
+slots_with_traffic AS (
+    SELECT
+        e.date,
+        e.provider,
+        e.charge_currency,
+        toUnixTimestamp(toDateTime(e.date)) / 86400                              AS abs_day,
+        coalesce(a.traffic, 0)                                                   AS traffic
+    FROM expected_slots e
+    LEFT JOIN actual a
+        ON  e.date            = a.date
+        AND e.provider        = a.provider
+        AND e.charge_currency = a.charge_currency
+),
+slots_with_prev AS (
+    SELECT
+        c.date,
+        c.provider,
+        c.charge_currency,
+        c.traffic                                                                AS current_traffic,
+        coalesce(p.traffic, 0)                                                   AS prev_day_traffic
+    FROM slots_with_traffic c
+    LEFT JOIN slots_with_traffic p
+        ON  c.provider        = p.provider
+        AND c.charge_currency = p.charge_currency
+        AND p.abs_day         = c.abs_day - 1
+)
+SELECT
+    s.date,
+    s.provider,
+    s.charge_currency,
+    s.current_traffic                                                               AS last_24h_traffic,
+    s.prev_day_traffic                                                              AS prev_24h_traffic,
+    coalesce(h.last_4_same_dow, '[-,-,-,-]')                                        AS last_4_same_dow,
+    CASE
+        WHEN s.current_traffic = 0
+            -- AND s.prev_day_traffic > 0
+            THEN 'CRITICAL - zero traffic (was active yesterday)'
+        ELSE 'OK'
+    END                                                                             AS alert_flag
+FROM slots_with_prev s
+LEFT JOIN historical_bracket h
+    ON  toDayOfWeek(s.date) = h.day_of_week
+    AND s.provider          = h.provider
+    AND s.charge_currency   = h.charge_currency
+ORDER BY s.date DESC, s.provider, s.charge_currency
