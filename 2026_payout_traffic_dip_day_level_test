@@ -1,0 +1,134 @@
+-- ============================================================
+-- Live Traffic Dip Alert — Merchant Level, Current 3-Hour Bucket
+-- Schedule: every 3 hours (e.g. 00:00, 03:00, 06:00 ... UTC)
+-- ============================================================
+
+WITH account_lookup AS (
+    SELECT
+        account_id,
+        argMax(business_name, peerdb_version) AS business_name
+    FROM datalake.clean_account
+    GROUP BY account_id
+    HAVING argMax(peerdb_is_deleted, peerdb_version) = 0
+),
+
+payout_lookup AS (
+    SELECT
+        payout_id,
+        argMax(account_id, peerdb_version) AS account_id
+    FROM datalake.clean_payout
+    WHERE created_at >= toDate('2026-04-13') - INTERVAL 35 DAY
+    GROUP BY payout_id
+    HAVING argMax(peerdb_is_deleted, peerdb_version) = 0
+),
+
+attempt_clean AS (
+    SELECT payout_attempt_id, payout_id, created_at
+    FROM datalake.clean_payout_attempt
+    WHERE created_at >= toDate('2026-04-13') - INTERVAL 35 DAY
+      AND payout_attempt_id != ''
+      AND peerdb_is_deleted = 0
+),
+
+-- Rank merchants by overall 35-day volume (same as backtest)
+top_merchants AS (
+    SELECT
+        acc.business_name as business_name,
+        count(DISTINCT pa.payout_attempt_id) AS total_attempts
+    FROM attempt_clean AS pa
+    INNER JOIN payout_lookup  AS p   ON pa.payout_id  = p.payout_id
+    INNER JOIN account_lookup AS acc ON p.account_id  = acc.account_id
+    GROUP BY acc.business_name
+),
+
+-- ── LIVE: only the CURRENT 3-hour bucket on today's date ──
+current_interval AS (
+    SELECT
+        acc.business_name as business_name,
+        toDate(pa.created_at)                AS date,
+        toDayOfWeek(pa.created_at)           AS day_of_week,
+        intDiv(toHour(pa.created_at), 3)     AS time_bucket,
+        count(DISTINCT pa.payout_attempt_id) AS attempts
+    FROM attempt_clean AS pa
+    INNER JOIN payout_lookup  AS p   ON pa.payout_id  = p.payout_id
+    INNER JOIN account_lookup AS acc ON p.account_id  = acc.account_id
+    INNER JOIN top_merchants  AS tm  ON acc.business_name = tm.business_name
+    WHERE toDate(pa.created_at) = '2026-04-13'
+    GROUP BY acc.business_name, date, day_of_week, time_bucket
+),
+
+-- ── HISTORICAL: same weekday + same bucket, last 4 weeks ──
+historical AS (
+    SELECT
+        acc.business_name as business_name,
+        toDate(pa.created_at)                AS date,
+        intDiv(toHour(pa.created_at), 3) AS time_bucket,
+        count(DISTINCT pa.payout_attempt_id) AS attempts
+    FROM attempt_clean AS pa
+    INNER JOIN payout_lookup  AS p   ON pa.payout_id  = p.payout_id
+    INNER JOIN account_lookup AS acc ON p.account_id  = acc.account_id
+    INNER JOIN top_merchants  AS tm  ON acc.business_name = tm.business_name
+    WHERE toDate(pa.created_at)      >= toDate('2026-04-13') - 28
+  AND toDate(pa.created_at)      <  '2026-04-13'
+  AND toDayOfWeek(pa.created_at) =  toDayOfWeek(toDate('2026-04-13'))
+    GROUP BY acc.business_name, date, time_bucket
+),
+
+compared AS (
+    SELECT
+        curr.business_name as business_name,
+        curr.date                            AS test_date,
+        curr.time_bucket,
+        curr.attempts                        AS current_attempts,
+        avg(hist.attempts)                   AS avg_attempts,
+        quantile(0.5)(hist.attempts)         AS median_attempts,
+        stddevPop(hist.attempts)             AS std_dev_attempts,
+        count(hist.attempts)                 AS weeks_compared
+    FROM current_interval AS curr
+    LEFT JOIN historical AS hist
+       ON curr.business_name = hist.business_name
+      AND curr.time_bucket   = hist.time_bucket  
+    GROUP BY
+        curr.business_name,
+        curr.date,
+        curr.time_bucket,
+        curr.attempts
+),
+
+final AS (
+    SELECT
+        toDate('2026-04-13') AS run_at,
+        test_date,
+        business_name,
+        time_bucket,
+        concat(
+            toString(time_bucket * 3), ':00 - ',
+            toString((time_bucket + 1) * 3), ':00'
+        )                                    AS time_range_utc,
+        concat(
+            toString(((time_bucket * 3) + 5) % 24), ':30 - ',
+            toString((((time_bucket + 1) * 3) + 5) % 24), ':30'
+        )                                    AS time_range_ist,
+        current_attempts,
+        round(avg_attempts, 1)               AS avg_attempts,
+        round(median_attempts, 1)            AS median_attempts,
+        round(std_dev_attempts, 1)           AS std_dev_attempts,
+        weeks_compared,
+        round(avg_attempts - current_attempts, 1)                               AS traffic_diff,
+        round(
+            (avg_attempts - current_attempts) / nullIf(avg_attempts, 0) * 100,
+        1)                                   AS pct_drop,
+        CASE
+            WHEN avg_attempts >= 3
+             AND (avg_attempts - current_attempts) / nullIf(avg_attempts, 0) * 100 > 80
+             AND (avg_attempts - current_attempts) > 10
+            THEN 'alert'
+            ELSE 'ok'
+        END                                  AS status
+    FROM compared
+)
+
+SELECT *
+FROM final
+WHERE status = 'alert'          -- remove this line if you want all merchants
+ORDER BY pct_drop DESC;
