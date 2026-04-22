@@ -1,0 +1,98 @@
+WITH account_lookup AS (
+    SELECT
+        account_id,
+        argMax(business_name, peerdb_version) AS business_name
+    FROM datalake.clean_account
+    GROUP BY account_id
+    HAVING argMax(peerdb_is_deleted, peerdb_version) = 0
+),
+
+
+
+payin_lookup AS (
+    SELECT
+        payin_id,
+        argMax(account_id, peerdb_version) AS account_id
+    FROM datalake.clean_payin
+    WHERE created_at >= now() - INTERVAL 50 DAY
+    GROUP BY payin_id
+    HAVING argMax(peerdb_is_deleted, peerdb_version) = 0
+),
+
+attempt_clean AS (
+    SELECT
+        payment_attempt_id,
+        payin_id,
+        created_at
+    FROM datalake.clean_payment_attempt
+    WHERE created_at >= now() - INTERVAL 50 DAY
+      AND payment_attempt_id != ''
+      AND peerdb_is_deleted = 0
+),
+
+traffic AS (
+    SELECT
+        acc.business_name AS business_name,
+        toDate(pa.created_at) AS test_date,
+        intDiv(toHour(pa.created_at), 3) AS time_bucket,
+        count(DISTINCT pa.payment_attempt_id) AS current_attempts
+    FROM attempt_clean pa
+    INNER JOIN payin_lookup p
+        ON pa.payin_id = p.payin_id
+    INNER JOIN account_lookup acc
+        ON p.account_id = acc.account_id
+    GROUP BY
+        acc.business_name,
+        test_date,
+        time_bucket
+),
+
+compared AS (
+    SELECT
+        curr.test_date,
+        curr.business_name,
+        curr.time_bucket,
+        curr.current_attempts,
+        avg(hist.current_attempts) AS avg_attempts,
+        quantile(0.5)(hist.current_attempts) AS median_attempts,
+        stddevPop(hist.current_attempts) AS std_dev_attempts
+    FROM traffic curr
+    INNER JOIN traffic hist
+        ON curr.business_name = hist.business_name
+       AND curr.time_bucket = hist.time_bucket
+       AND hist.test_date >= curr.test_date - 20
+       AND hist.test_date < curr.test_date
+    WHERE curr.test_date >= today() - 30
+    GROUP BY
+        curr.test_date,
+        curr.business_name,
+        curr.time_bucket,
+        curr.current_attempts
+),
+
+final AS (
+    SELECT
+        test_date,
+        business_name,
+        time_bucket,
+        concat(toString(time_bucket * 3), ':00 - ', toString((time_bucket + 1) * 3), ':00') AS time_range_utc,
+        concat(
+            toString(((time_bucket * 3) + 5) % 24), ':30 - ',
+            toString((((time_bucket + 1) * 3) + 5) % 24), ':30'
+        ) AS time_range_ist,
+        current_attempts,
+        round(avg_attempts, 1) AS avg_attempts,
+        round(median_attempts, 1) AS median_attempts,
+        round(std_dev_attempts, 1) AS std_dev_attempts,
+        round(avg_attempts - current_attempts, 1) AS traffic_diff,
+        round((avg_attempts - current_attempts) / avg_attempts * 100, 1) AS pct_drop,
+        'alert' AS status
+    FROM compared
+    WHERE avg_attempts > 0
+      AND ((avg_attempts - current_attempts) / avg_attempts * 100) > 90
+      AND (avg_attempts - current_attempts) > 20
+)
+
+SELECT *
+FROM final
+ORDER BY test_date DESC, pct_drop DESC
